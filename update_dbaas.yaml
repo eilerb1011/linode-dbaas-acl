@@ -1,0 +1,154 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dbinfo
+  namespace: default
+data:
+  dbtype: postgresql
+  instanceid: "6digits"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: acl
+  namespace: default
+data:
+  static-cidrs: |
+    8.8.8.8/32
+    2600:3c06::f03c:95ff:feb2:464b/128
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: update-token
+  namespace: default
+type: Opaque
+data:
+  update-token: placeyourtokenhere
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: acl-updater
+  namespace: default
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: node-reader
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: read-nodes
+  namespace: default
+roleRef:
+  kind: ClusterRole
+  name: node-reader
+  apiGroup: rbac.authorization.k8s.io
+subjects:
+- kind: ServiceAccount
+  name: acl-updater
+  namespace: default
+
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: acl-updater
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: acl-updater
+  template:
+    metadata:
+      labels:
+        app: acl-updater
+    spec:
+      serviceAccountName: acl-updater
+      containers:
+      - name: acl-updater
+        image: alpine:latest
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            set -e
+            apk update && apk add --no-cache curl jq
+
+            while true; do
+              echo "Waiting for a random number of seconds between 1 and 180..."
+              sleep $((RANDOM % 180 + 1))
+
+              API_SERVER="https://kubernetes.default.svc"
+              TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+              CACERT="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+
+              DB_TYPE=$(cat /dbinfo/dbtype)
+              INSTANCE_ID=$(cat /dbinfo/instanceid)
+              LINODE_API="https://api.linode.com/v4/databases/${DB_TYPE}/instances/${INSTANCE_ID}"
+
+              AUTH_HEADER="Authorization: Bearer $(cat /secrets/update-token)"
+
+              cidr_list=""
+
+              echo "Adding static CIDRs from ConfigMap..."
+              while read -r cidr; do
+                cidr_list="${cidr_list},\"$cidr\""
+              done < /config/static-cidrs
+
+              echo "Fetching and formatting external IPs from all nodes..."
+              node_ips=$(curl -sSk --cacert "$CACERT" \
+                -H "Authorization: Bearer $TOKEN" \
+                "$API_SERVER/api/v1/nodes" \
+                | jq -r '.items[].status.addresses[]
+                  | select(.type == "ExternalIP")
+                  | "\(.address)\(if .address | test(":") then "/128" else "/32" end)"')
+
+              for ip in $node_ips; do
+                cidr_list="${cidr_list},\"$ip\""
+              done
+
+              # Remove leading comma
+              cidr_list="${cidr_list#,}"
+
+              echo "Final allow_list payload:"
+              echo "{\"allow_list\": [${cidr_list}]}"
+
+              echo "Updating ACL via Linode API..."
+              curl -s -X PUT "$LINODE_API" \
+                -H "$AUTH_HEADER" \
+                -H "Content-Type: application/json" \
+                -d "{\"allow_list\": [${cidr_list}]}"
+
+              echo "Sleeping for 24 hours..."
+              sleep 86400
+            done
+        volumeMounts:
+        - name: secret
+          mountPath: /secrets
+          readOnly: true
+        - name: config
+          mountPath: /config
+          readOnly: true
+        - name: dbinfo
+          mountPath: /dbinfo
+          readOnly: true
+      restartPolicy: Always
+      volumes:
+      - name: secret
+        secret:
+          secretName: update-token
+      - name: config
+        configMap:
+          name: acl
+      - name: dbinfo
+        configMap:
+          name: dbinfo
