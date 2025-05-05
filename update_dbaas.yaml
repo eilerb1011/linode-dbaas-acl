@@ -84,8 +84,8 @@ spec:
             apk update && apk add --no-cache curl jq
 
             while true; do
-              echo "Waiting for a random number of seconds between 1 and 180..."
-              sleep $((RANDOM % 180 + 1))
+              echo "Waiting for a random number of seconds between 1 and 60..."
+              sleep $((RANDOM % 60 + 1))
 
               API_SERVER="https://kubernetes.default.svc"
               TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
